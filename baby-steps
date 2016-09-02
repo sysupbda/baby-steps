@@ -7,7 +7,9 @@ OPTIND=1
 verbose=0
 logfile=""
 
-usage="$scriptname [-h|?] [-v] [-m maximum] [-a action] [-i condition] [-t threshold] [-e <exclude>] path [path2] [... pathn] -- Run baby steps on paths
+show_help()
+{
+    echo "$scriptname [-h|?] [-v] [-m maximum] [-a action] [-i condition] [-t threshold] [-e <exclude>] path [path2] [... pathn] -- Run baby steps on paths
 
 where:
     -h/?          show this help text
@@ -19,6 +21,7 @@ where:
     -i  condition command to test, that when successful resets the timer
     -t  threshold progress to maximum threhold to start showing warnings
     path  	  root directory of files to watch"
+}
 
 while getopts "h?ve:f:m:a:i:t:" opt; do
     case "$opt" in
@@ -50,7 +53,7 @@ paths=$*
 if [ -z "$paths" ]
 then
     echo "At least one path must be provided" >&2
-    echo "$usage"  >&2
+    show_help()  >&2
     exit 1
 fi
 
