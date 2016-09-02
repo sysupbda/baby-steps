@@ -1,0 +1,244 @@
+#!/bin/bash
+
+scriptname=$(basename "$0")
+currenttime=$(date '+%Y-%m-%d.%H:%M:%S')
+
+OPTIND=1
+verbose=0
+logfile=""
+
+usage="$scriptname [-h|?] [-v] [-m maximum] [-a action] [-i condition] [-t threshold] [-e <exclude>] path [path2] [... pathn] -- Run baby steps on paths
+
+where:
+    -h/?          show this help text
+    -v            show decision tree on each file change event
+    -e  exclude   file patterns to ignore
+    -f  frequency change check frequency
+    -m  maximum   maximum time with relevant changes trigger
+    -a  action    command to call when max time trigger is reached
+    -i  condition command to test, that when successful resets the timer
+    -t  threshold progress to maximum threhold to start showing warnings
+    path  	  root directory of files to watch"
+
+while getopts "h?ve:f:m:a:i:t:" opt; do
+    case "$opt" in
+    h|\?)
+        show_help >&2
+        exit 0
+        ;;
+    v)  verbose=1
+        ;;
+    e)  exclude=$OPTARG
+        ;;
+    f)  frequency=$OPTARG
+        ;;
+    m)  maximumTrigger=$OPTARG
+        ;;
+    a)  triggerAction=$OPTARG
+        ;;
+    i)  additionalResetCondition=$OPTARG
+        ;;
+    t)  warningThreshold=$OPTARG
+        ;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+paths=$*
+
+if [ -z "$paths" ]
+then
+    echo "At least one path must be provided" >&2
+    echo "$usage"  >&2
+    exit 1
+fi
+
+if [ -z "$frequency" ]
+then
+    frequency=5
+fi
+
+if [ -z "$maximumTrigger" ]
+then
+    maximumTrigger=300
+fi
+
+if [ -z "$triggerAction" ]
+then
+    triggerAction="git reset --hard && git clean -f -d"
+fi
+
+if [ $verbose -eq 1 ]; then
+    echo "Using $0 -f $frequency -m $maximumTrigger -a '$triggerAction' $paths"
+fi
+
+relevantChangesExists()
+{
+    toBeCommitted=$(git status -s | wc -l)
+    if [ $toBeCommitted != 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+isARelevantChange()
+{
+    git status -s | grep $(basename $1) > /dev/null
+    revelantChangesStatus=$?
+    return $revelantChangesStatus
+}
+
+isTimeToResetTimer()
+{
+    if [ -n "$additionalResetCondition" ]; then
+	eval "$additionalResetCondition"
+	resetCondition=$?
+	if [ $resetCondition -eq 0 ]; then
+	    if [ $verbose -eq 1 ]; then
+		echo $(date) "'$additionalResetCondition' returned 0, reseting timer"
+	    fi
+	    
+            return 1
+        fi
+    fi
+    
+    if [ -f /tmp/last-current-baby-step-commit.sha ]; then
+        diff /tmp/last-current-baby-step-commit.sha /tmp/current-baby-step-commit.sha > /dev/null
+        difference=$?
+        cp /tmp/current-baby-step-commit.sha /tmp/last-current-baby-step-commit.sha
+        if [ $difference != 0 ]; then
+	    if [ $verbose -eq 1 ]; then
+		echo $(date) "New commit sha, reseting timer"
+	    fi
+
+            return 1
+        fi
+    elif [ -f /tmp/current-baby-step-timer.lock ]; then
+            if [ $$ -eq "$(cat /tmp/current-baby-step-timer.lock)" ]; then
+		if [ $verbose -eq 1 ]; then
+		    echo $(date) "Different PID in baby-step timer lock, reseting timer"
+		fi
+            return 1
+        fi
+    fi
+    return 0
+}
+
+resetTimerState()
+{
+    cp /tmp/current-baby-step-commit.sha /tmp/last-current-baby-step-commit.sha
+    if [ -f /tmp/current-baby-step.elapsed-time ]
+    then
+        rm /tmp/current-baby-step.elapsed-time
+    fi
+}
+
+launchTriggerAction()
+{
+    outputStream='> /dev/null'
+    if [ $verbose -eq 1 ]; then
+	outputStream=''
+	echo $(date) 'Triggering action $triggerAction'
+    fi
+    eval "$triggerAction $outputStream"
+    resetTimerState
+}
+
+incrementTimerState()
+{
+    if [ -f /tmp/current-baby-step.elapsed-time ]
+    then
+        elapsedTime=$(echo $(cat /tmp/current-baby-step.elapsed-time)+$frequency | bc -l)
+        echo $elapsedTime > /tmp/current-baby-step.elapsed-time.$$
+        mv /tmp/current-baby-step.elapsed-time.$$ /tmp/current-baby-step.elapsed-time
+
+	progressPercentage=$(echo $(cat /tmp/current-baby-step.elapsed-time)/$maximumTrigger*100 | bc -l)
+
+	if [ -n "$warningThreshold" ]; then
+	    flooredPercentage="$(echo $progressPercentage | cut -d. -f1)"
+	    if [ $flooredPercentage -ge "$(echo $warningThreshold | tr -d '%')" ]; then
+		echo Now at $flooredPercentage'%' of maximum threshold
+	    fi
+	fi
+	
+        if [ "$elapsedTime" -ge "$maximumTrigger" ]
+        then
+	    launchTriggerAction
+	    return 0
+        fi
+    else
+       echo 0 > /tmp/current-baby-step.elapsed-time
+    fi
+    return $(cat /tmp/current-baby-step.elapsed-time)
+}
+
+coreLoop()
+{
+     isTimeToResetTimer
+     if [ $? -ne 0 ]
+     then
+         resetTimerState
+     fi
+     incrementTimerState 
+     sleep $frequency
+
+     relevantChangesExists
+     if [ $? != 0 ]
+     then
+        startTimer
+     else
+        resetTimerState
+     fi
+}
+
+startTimer()
+{
+     echo $$ > /tmp/current-baby-step-timer.lock
+     (coreLoop)
+}
+
+ifNotTimingStartNow()
+{
+    git log -1 HEAD | awk '/commit/ {print $2}' > /tmp/current-baby-step-commit.sha
+    isTimeToResetTimer
+    if [ $? -ne 0 ]
+    then
+        resetTimerState
+    fi
+    if [ -f /tmp/current-baby-step-timer.lock ]
+    then
+        if [ $$ -eq "$(cat /tmp/current-baby-step-timer.lock)" ] && [ -f /tmp/current-baby-step.elapsed-time ]
+        then
+            echo .
+        else
+            echo $$ > /tmp/current-baby-step-timer.lock
+            resetTimerState
+            startTimer
+        fi
+    else
+        startTimer
+    fi
+}  
+
+readEvents()
+{
+    while read filename
+    do
+        relevantChangesExists
+        if [ $? != 0 ]
+        then
+           ifNotTimingStartNow $event
+        fi
+    done
+}
+
+pathsLoop()
+{
+    for path in $paths
+    do
+      (fswatch $path | readEvents)
+    done
+}
+
+pathsLoop
